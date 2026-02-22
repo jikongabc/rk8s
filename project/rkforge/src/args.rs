@@ -148,8 +148,6 @@ pub struct WaitArgs {
     #[arg(long, default_value = "0")]
     pub timeout: u64,
 }
-
-/// Remove one or more containers
 /// Remove one or more containers
 #[derive(Parser, Debug, Clone)]
 pub struct RmArgs {

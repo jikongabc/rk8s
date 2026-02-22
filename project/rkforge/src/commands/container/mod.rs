@@ -1107,8 +1107,8 @@ pub fn attach_container(id: &str) -> Result<()> {
     use anyhow::Context;
     use nix::sys::termios::{self, SetArg};
     use std::io::{Read, Write};
-    use std::os::fd::BorrowedFd;
-    use std::os::unix::io::AsRawFd;
+    use std::os::fd::{BorrowedFd, OwnedFd};
+    use std::os::unix::io::{AsRawFd, FromRawFd};
 
     let root_path = rootpath::determine(None, &*create_syscall())?;
     let container = load_container(&root_path, id)?;
@@ -1123,7 +1123,6 @@ pub fn attach_container(id: &str) -> Result<()> {
 
     let pid_raw = pid.as_raw();
 
-    // Access container stdio via /proc/<pid>/fd
     let stdout_path = format!("/proc/{}/fd/1", pid_raw);
     let stderr_path = format!("/proc/{}/fd/2", pid_raw);
     let stdin_path = format!("/proc/{}/fd/0", pid_raw);
@@ -1141,13 +1140,21 @@ pub fn attach_container(id: &str) -> Result<()> {
         .open(&stdin_path)
         .with_context(|| format!("Failed to open container stdin: {}", stdin_path))?;
 
-    // dup() the fds to get independent file descriptors pointing to the same underlying files.
-    // Closing these dup'd fds will cause the reader threads' read() to return,
-    // without interfering with the File cleanup when threads drop container_stdout/stderr.
-    let stdout_wake_fd = nix::unistd::dup(container_stdout.as_raw_fd())
-        .with_context(|| "Failed to dup stdout fd")?;
-    let stderr_wake_fd = nix::unistd::dup(container_stderr.as_raw_fd())
-        .with_context(|| "Failed to dup stderr fd")?;
+    // dup() into OwnedFd for RAII cleanup on both detach and EOF paths.
+    // These are independent fd table entries and do not affect the reader threads,
+    // which own container_stdout/stderr and exit only when the container closes its fds.
+    let stdout_wake_fd: OwnedFd = unsafe {
+        OwnedFd::from_raw_fd(
+            nix::unistd::dup(container_stdout.as_raw_fd())
+                .with_context(|| "Failed to dup stdout fd")?,
+        )
+    };
+    let stderr_wake_fd: OwnedFd = unsafe {
+        OwnedFd::from_raw_fd(
+            nix::unistd::dup(container_stderr.as_raw_fd())
+                .with_context(|| "Failed to dup stderr fd")?,
+        )
+    };
 
     // Switch host terminal to raw mode so we can intercept individual keystrokes
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
@@ -1164,7 +1171,6 @@ pub fn attach_container(id: &str) -> Result<()> {
     // Use \r\n because terminal is in raw mode (no output processing)
     print!("Attached to {}. Use Ctrl+P, Ctrl+Q to detach.\r\n", id);
 
-    // Forward container stdout -> host stdout
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut host_stdout = std::io::stdout();
@@ -1180,7 +1186,6 @@ pub fn attach_container(id: &str) -> Result<()> {
         }
     });
 
-    // Forward container stderr -> host stderr
     let stderr_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut host_stderr = std::io::stderr();
@@ -1196,9 +1201,8 @@ pub fn attach_container(id: &str) -> Result<()> {
         }
     });
 
-    // Forward host stdin -> container stdin.
-    // Detach sequence: Ctrl+P (0x10) followed by Ctrl+Q (0x11).
-    // Only the exact two-byte sequence is consumed; other keys are forwarded normally.
+    // Ctrl+P (0x10) followed by Ctrl+Q (0x11) detaches.
+    // Only this exact sequence is consumed; all other input is forwarded normally.
     let mut buf = [0u8; 1];
     let mut last_was_ctrl_p = false;
     let mut detached = false;
@@ -1212,20 +1216,16 @@ pub fn attach_container(id: &str) -> Result<()> {
                 if last_was_ctrl_p {
                     last_was_ctrl_p = false;
                     if byte == 0x11 {
-                        // Ctrl+P Ctrl+Q: detach, swallow both bytes
                         drop(container_stdin);
-                        let _ = nix::unistd::close(stdout_wake_fd);
-                        let _ = nix::unistd::close(stderr_wake_fd);
                         detached = true;
                         break;
                     }
-                    // Not a detach sequence: forward the pending Ctrl+P and current byte
+                    // Not a detach sequence: forward the held Ctrl+P and current byte
                     let _ = container_stdin.write_all(&[0x10]);
                     let _ = container_stdin.write_all(&buf);
                     continue;
                 }
                 if byte == 0x10 {
-                    // Tentatively hold Ctrl+P, wait to see if next byte is Ctrl+Q
                     last_was_ctrl_p = true;
                     continue;
                 }
@@ -1239,12 +1239,16 @@ pub fn attach_container(id: &str) -> Result<()> {
 
     if detached {
         println!("\nDetached from container {}.", id);
-        // Threads are blocked on container fds; drop handles without joining so
-        // attach returns immediately. Threads will be cleaned up when process exits.
+        // Threads block on container fds until the container exits; drop handles
+        // without joining so attach returns immediately.
+        drop(stdout_wake_fd);
+        drop(stderr_wake_fd);
         drop(stdout_thread);
         drop(stderr_thread);
     } else {
         // Container closed its stdio (EOF); join threads for ordered shutdown
+        drop(stdout_wake_fd);
+        drop(stderr_wake_fd);
         let _ = stdout_thread.join();
         let _ = stderr_thread.join();
     }
