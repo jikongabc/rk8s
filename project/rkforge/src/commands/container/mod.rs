@@ -882,21 +882,29 @@ pub fn kill_container(id: &str, signal: &str) -> Result<()> {
     let root_path = rootpath::determine(None, &*create_syscall())?;
     let container = load_container(&root_path, id)?;
 
+    // Refuse to signal a stopped container to avoid hitting a recycled pid
+    if container.status() != ContainerStatus::Running {
+        return Err(anyhow!("container {} is not running", id));
+    }
+
     let pid = container
         .pid()
         .ok_or_else(|| anyhow!("container {} has no pid", id))?;
 
-    // Accept both "SIGKILL" and "KILL" formats
-    let sig_str = if signal.starts_with("SIG") {
-        signal.to_string()
-    } else {
-        format!("SIG{}", signal)
+    // Accept "kill", "KILL", "sigkill", "SIGKILL" formats
+    let sig_str = {
+        let upper = signal.to_uppercase();
+        if upper.starts_with("SIG") {
+            upper
+        } else {
+            format!("SIG{}", upper)
+        }
     };
 
     let sig = Signal::from_str(&sig_str).map_err(|_| anyhow!("unknown signal: {}", signal))?;
 
     signal::kill(pid, sig)?;
-    info!("Sent {} to container {}", sig_str, id);
+    println!("Sent {} to container {}", sig_str, id);
     Ok(())
 }
 
@@ -911,7 +919,7 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
     let container = load_container(&root_path, id)?;
 
     if container.status() == ContainerStatus::Stopped {
-        info!("Container {} is already stopped", id);
+        println!("Container {} is already stopped", id);
         return Ok(());
     }
 
@@ -920,7 +928,7 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
         .ok_or_else(|| anyhow!("container {} has no pid", id))?;
 
     signal::kill(pid, Signal::SIGTERM)?;
-    info!("Sent SIGTERM to container {}", id);
+    println!("Sent SIGTERM to container {}", id);
 
     // Poll until stopped or timeout
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
@@ -929,14 +937,14 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
 
         let c = load_container(&root_path, id)?;
         if c.status() == ContainerStatus::Stopped {
-            info!("Container {} stopped gracefully", id);
+            println!("Container {} stopped gracefully", id);
             return Ok(());
         }
 
         if Instant::now() >= deadline {
             signal::kill(pid, Signal::SIGKILL)?;
-            info!("Timeout reached, sent SIGKILL to container {}", id);
-            // Wait for process to be reaped to avoid zombie, retry on EINTR
+            println!("Timeout reached, sent SIGKILL to container {}", id);
+            // waitpid works only if container is a direct child; silently ignore ECHILD
             loop {
                 match waitpid(pid, None) {
                     std::result::Result::Ok(WaitStatus::Exited(..))
@@ -951,6 +959,7 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
 }
 
 /// Wait for a container to stop and print its exit code.
+/// Note: exit code is always 0 because libcontainer does not expose it.
 pub fn wait_container(id: &str) -> Result<()> {
     use std::time::Duration;
 
@@ -959,7 +968,7 @@ pub fn wait_container(id: &str) -> Result<()> {
     loop {
         let container = load_container(&root_path, id)?;
         if container.status() == ContainerStatus::Stopped {
-            // libcontainer does not store exit code, print 0 as convention
+            // libcontainer does not store exit code; print 0 as convention
             println!("0");
             return Ok(());
         }
@@ -974,14 +983,15 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
     use nix::sys::signal::{self, Signal};
     use nix::sys::wait::{WaitStatus, waitpid};
 
-    // Send SIGKILL and wait for process exit, retrying on EINTR to avoid zombie.
+    // Send SIGKILL and wait for process exit, retrying on EINTR.
+    // waitpid only works if the container is a direct child; ECHILD is silently ignored.
     let force_kill = |pid: nix::unistd::Pid| {
         let _ = signal::kill(pid, Signal::SIGKILL);
         loop {
             match waitpid(pid, None) {
                 std::result::Result::Ok(WaitStatus::Exited(..))
                 | std::result::Result::Ok(WaitStatus::Signaled(..)) => break,
-                std::result::Result::Err(Errno::EINTR) => continue, // retry on interrupt
+                std::result::Result::Err(Errno::EINTR) => continue,
                 _ => break,
             }
         }
@@ -1003,15 +1013,15 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
             };
             if container.status() == ContainerStatus::Stopped {
                 delete_container(&container_id)?;
-                info!("Removed container {}", container_id);
+                println!("Removed container {}", container_id);
             } else if force {
                 if let Some(pid) = container.pid() {
                     force_kill(pid);
                 }
                 delete_container(&container_id)?;
-                info!("Force removed container {}", container_id);
+                println!("Force removed container {}", container_id);
             } else {
-                info!(
+                println!(
                     "Skipping running container {} (use -f to force remove)",
                     container_id
                 );
@@ -1037,7 +1047,7 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
     }
 
     delete_container(id)?;
-    info!("Removed container {}", id);
+    println!("Removed container {}", id);
     Ok(())
 }
 
@@ -1083,11 +1093,11 @@ pub fn attach_container(id: &str) -> Result<()> {
     let stderr_path = format!("/proc/{}/fd/2", pid_raw);
     let stdin_path = format!("/proc/{}/fd/0", pid_raw);
 
-    let mut container_stdout = std::fs::OpenOptions::new()
+    let container_stdout = std::fs::OpenOptions::new()
         .read(true)
         .open(&stdout_path)
         .with_context(|| format!("Failed to open container stdout: {}", stdout_path))?;
-    let mut container_stderr = std::fs::OpenOptions::new()
+    let container_stderr = std::fs::OpenOptions::new()
         .read(true)
         .open(&stderr_path)
         .with_context(|| format!("Failed to open container stderr: {}", stderr_path))?;
@@ -1096,9 +1106,13 @@ pub fn attach_container(id: &str) -> Result<()> {
         .open(&stdin_path)
         .with_context(|| format!("Failed to open container stdin: {}", stdin_path))?;
 
-    // Save fd numbers before moving into threads, used to unblock reader threads on detach
-    let stdout_fd = container_stdout.as_raw_fd();
-    let stderr_fd = container_stderr.as_raw_fd();
+    // dup() the fds so we have a separate fd to close for unblocking reader threads.
+    // The original fds are owned by container_stdout/stderr (moved into threads);
+    // closing the dup'd fds will not cause a double-close when threads exit.
+    let stdout_wake_fd = nix::unistd::dup(container_stdout.as_raw_fd())
+        .with_context(|| "Failed to dup stdout fd")?;
+    let stderr_wake_fd = nix::unistd::dup(container_stderr.as_raw_fd())
+        .with_context(|| "Failed to dup stderr fd")?;
 
     // Switch host terminal to raw mode so we can intercept individual keystrokes
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
@@ -1112,12 +1126,14 @@ pub fn attach_container(id: &str) -> Result<()> {
         orig: original_termios,
     };
 
-    println!("Attached to {}. Use Ctrl+P, Ctrl+Q to detach.", id);
+    // Use \r\n because terminal is in raw mode (no output processing)
+    print!("Attached to {}. Use Ctrl+P, Ctrl+Q to detach.\r\n", id);
 
     // Forward container stdout -> host stdout
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut host_stdout = std::io::stdout();
+        let mut container_stdout = container_stdout;
         loop {
             match container_stdout.read(&mut buf) {
                 std::result::Result::Ok(0) | std::result::Result::Err(_) => break,
@@ -1133,6 +1149,7 @@ pub fn attach_container(id: &str) -> Result<()> {
     let stderr_thread = std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut host_stderr = std::io::stderr();
+        let mut container_stderr = container_stderr;
         loop {
             match container_stderr.read(&mut buf) {
                 std::result::Result::Ok(0) | std::result::Result::Err(_) => break,
@@ -1159,9 +1176,9 @@ pub fn attach_container(id: &str) -> Result<()> {
                     if byte == 0x11 {
                         // Close container stdin immediately
                         drop(container_stdin);
-                        // Close stdout/stderr fds to unblock reader threads
-                        let _ = nix::unistd::close(stdout_fd);
-                        let _ = nix::unistd::close(stderr_fd);
+                        // Close dup'd fds to unblock reader threads without double-closing
+                        let _ = nix::unistd::close(stdout_wake_fd);
+                        let _ = nix::unistd::close(stderr_wake_fd);
                         break;
                     }
                     last_was_ctrl_p = false;
