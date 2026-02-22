@@ -910,9 +910,7 @@ pub fn kill_container(id: &str, signal: &str) -> Result<()> {
 
 /// Gracefully stop a container: SIGTERM first, then SIGKILL after timeout.
 pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
-    use nix::errno::Errno;
     use nix::sys::signal::{self, Signal};
-    use nix::sys::wait::{WaitStatus, waitpid};
     use std::time::{Duration, Instant};
 
     let root_path = rootpath::determine(None, &*create_syscall())?;
@@ -930,7 +928,6 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
     signal::kill(pid, Signal::SIGTERM)?;
     println!("Sent SIGTERM to container {}", id);
 
-    // Poll until stopped or timeout
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     loop {
         std::thread::sleep(Duration::from_millis(200));
@@ -944,14 +941,14 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
         if Instant::now() >= deadline {
             signal::kill(pid, Signal::SIGKILL)?;
             println!("Timeout reached, sent SIGKILL to container {}", id);
-            // waitpid works only if container is a direct child; silently ignore ECHILD
-            loop {
-                match waitpid(pid, None) {
-                    std::result::Result::Ok(WaitStatus::Exited(..))
-                    | std::result::Result::Ok(WaitStatus::Signaled(..)) => break,
-                    std::result::Result::Err(Errno::EINTR) => continue,
-                    _ => break,
+            // Poll /proc/<pid> until the process disappears, since waitpid only works
+            // for direct children and container runtimes typically use double-fork.
+            let proc_path = std::path::PathBuf::from(format!("/proc/{}", pid.as_raw()));
+            for _ in 0..50 {
+                if !proc_path.exists() {
+                    break;
                 }
+                std::thread::sleep(Duration::from_millis(100));
             }
             return Ok(());
         }
@@ -960,10 +957,16 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
 
 /// Wait for a container to stop and print its exit code.
 /// Note: exit code is always 0 because libcontainer does not expose it.
-pub fn wait_container(id: &str) -> Result<()> {
-    use std::time::Duration;
+/// If timeout is 0, wait indefinitely; otherwise return error on timeout.
+pub fn wait_container(id: &str, timeout_secs: u64) -> Result<()> {
+    use std::time::{Duration, Instant};
 
     let root_path = rootpath::determine(None, &*create_syscall())?;
+    let deadline = if timeout_secs > 0 {
+        Some(Instant::now() + Duration::from_secs(timeout_secs))
+    } else {
+        None
+    };
 
     loop {
         let container = load_container(&root_path, id)?;
@@ -972,6 +975,11 @@ pub fn wait_container(id: &str) -> Result<()> {
             println!("0");
             return Ok(());
         }
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                return Err(anyhow!("timeout waiting for container {} to stop", id));
+            }
+        }
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -979,21 +987,20 @@ pub fn wait_container(id: &str) -> Result<()> {
 /// Remove a container and its metadata.
 /// -f: force remove running container; -a: remove all stopped containers (with -f, also removes running).
 pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
-    use nix::errno::Errno;
     use nix::sys::signal::{self, Signal};
-    use nix::sys::wait::{WaitStatus, waitpid};
+    use std::time::Duration;
 
-    // Send SIGKILL and wait for process exit, retrying on EINTR.
-    // waitpid only works if the container is a direct child; ECHILD is silently ignored.
+    // Send SIGKILL then poll /proc/<pid> until process disappears.
+    // waitpid is not used because container runtimes typically double-fork,
+    // making the container process not a direct child of rkforge.
     let force_kill = |pid: nix::unistd::Pid| {
         let _ = signal::kill(pid, Signal::SIGKILL);
-        loop {
-            match waitpid(pid, None) {
-                std::result::Result::Ok(WaitStatus::Exited(..))
-                | std::result::Result::Ok(WaitStatus::Signaled(..)) => break,
-                std::result::Result::Err(Errno::EINTR) => continue,
-                _ => break,
+        let proc_path = std::path::PathBuf::from(format!("/proc/{}", pid.as_raw()));
+        for _ in 0..50 {
+            if !proc_path.exists() {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
     };
 
@@ -1106,9 +1113,9 @@ pub fn attach_container(id: &str) -> Result<()> {
         .open(&stdin_path)
         .with_context(|| format!("Failed to open container stdin: {}", stdin_path))?;
 
-    // dup() the fds so we have a separate fd to close for unblocking reader threads.
-    // The original fds are owned by container_stdout/stderr (moved into threads);
-    // closing the dup'd fds will not cause a double-close when threads exit.
+    // dup() the fds to get independent file descriptors pointing to the same underlying files.
+    // Closing these dup'd fds will cause the reader threads' read() to return,
+    // without interfering with the File cleanup when threads drop container_stdout/stderr.
     let stdout_wake_fd = nix::unistd::dup(container_stdout.as_raw_fd())
         .with_context(|| "Failed to dup stdout fd")?;
     let stderr_wake_fd = nix::unistd::dup(container_stderr.as_raw_fd())
@@ -1161,8 +1168,9 @@ pub fn attach_container(id: &str) -> Result<()> {
         }
     });
 
-    // Forward host stdin -> container stdin
-    // Ctrl+P (0x10) followed by Ctrl+Q (0x11) detaches; both bytes are swallowed
+    // Forward host stdin -> container stdin.
+    // Detach sequence: Ctrl+P (0x10) followed by Ctrl+Q (0x11).
+    // Only the exact two-byte sequence is consumed; other keys are forwarded normally.
     let mut buf = [0u8; 1];
     let mut last_was_ctrl_p = false;
     let mut host_stdin = std::io::stdin();
@@ -1173,18 +1181,21 @@ pub fn attach_container(id: &str) -> Result<()> {
             std::result::Result::Ok(_) => {
                 let byte = buf[0];
                 if last_was_ctrl_p {
+                    last_was_ctrl_p = false;
                     if byte == 0x11 {
-                        // Close container stdin immediately
+                        // Ctrl+P Ctrl+Q: detach, swallow both bytes
                         drop(container_stdin);
-                        // Close dup'd fds to unblock reader threads without double-closing
                         let _ = nix::unistd::close(stdout_wake_fd);
                         let _ = nix::unistd::close(stderr_wake_fd);
                         break;
                     }
-                    last_was_ctrl_p = false;
+                    // Not a detach sequence: forward the pending Ctrl+P and current byte
+                    let _ = container_stdin.write_all(&[0x10]);
+                    let _ = container_stdin.write_all(&buf);
                     continue;
                 }
                 if byte == 0x10 {
+                    // Tentatively hold Ctrl+P, wait to see if next byte is Ctrl+Q
                     last_was_ctrl_p = true;
                     continue;
                 }
@@ -1197,8 +1208,8 @@ pub fn attach_container(id: &str) -> Result<()> {
     drop(_guard);
     println!("\nDetached from container {}.", id);
 
-    // Threads exit naturally after fds are closed; no join needed
-    drop(stdout_thread);
-    drop(stderr_thread);
+    // Join threads to ensure ordered shutdown
+    let _ = stdout_thread.join();
+    let _ = stderr_thread.join();
     Ok(())
 }

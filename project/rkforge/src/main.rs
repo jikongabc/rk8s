@@ -87,7 +87,7 @@ fn main() -> Result<()> {
         Commands::ExecInternal(args) => run::exec_internal(args),
         Commands::Kill(args) => container::kill_container(&args.container_name, &args.signal),
         Commands::Stop(args) => container::stop_container(&args.container_name, args.timeout),
-        Commands::Wait(args) => container::wait_container(&args.container_name),
+        Commands::Wait(args) => container::wait_container(&args.container_name, args.timeout),
         Commands::Rm(args) => {
             container::rm_container(args.container_name.as_deref(), args.force, args.all)
         }

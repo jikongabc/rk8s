@@ -143,6 +143,10 @@ pub struct StopArgs {
 pub struct WaitArgs {
     #[arg(value_name = "CONTAINER_NAME")]
     pub container_name: String,
+
+    /// Timeout in seconds (0 means wait indefinitely)
+    #[arg(long, default_value = "0")]
+    pub timeout: u64,
 }
 /// Remove one or more containers
 #[derive(Parser, Debug, Clone)]
