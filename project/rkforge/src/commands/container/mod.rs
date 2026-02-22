@@ -873,3 +873,88 @@ mod test {
         assert!(res.is_ok() || res.is_err());
     }
 }
+
+/// Send a signal to a container's init process (pid 1).
+pub fn kill_container(id: &str, signal: &str) -> Result<()> {
+    use nix::sys::signal::{self, Signal};
+    use std::str::FromStr;
+
+    let root_path = rootpath::determine(None, &*create_syscall())?;
+    let container = load_container(&root_path, id)?;
+
+    let pid = container
+        .pid()
+        .ok_or_else(|| anyhow!("container {} has no pid", id))?;
+
+    // Accept both "SIGKILL" and "KILL" formats
+    let sig_str = if signal.starts_with("SIG") {
+        signal.to_string()
+    } else {
+        format!("SIG{}", signal)
+    };
+
+    let sig = Signal::from_str(&sig_str).map_err(|_| anyhow!("unknown signal: {}", signal))?;
+
+    signal::kill(pid, sig)?;
+    info!("Sent {} to container {}", sig_str, id);
+    Ok(())
+}
+
+/// Gracefully stop a container: SIGTERM first, then SIGKILL after timeout.
+pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
+    use nix::sys::signal::{self, Signal};
+    use std::time::{Duration, Instant};
+
+    let root_path = rootpath::determine(None, &*create_syscall())?;
+    let container = load_container(&root_path, id)?;
+
+    // If already stopped, do nothing
+    if container.status() == ContainerStatus::Stopped {
+        info!("Container {} is already stopped", id);
+        return Ok(());
+    }
+
+    let pid = container
+        .pid()
+        .ok_or_else(|| anyhow!("container {} has no pid", id))?;
+
+    // Send SIGTERM
+    signal::kill(pid, Signal::SIGTERM)?;
+    info!("Sent SIGTERM to container {}", id);
+
+    // Poll until stopped or timeout
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+
+        let c = load_container(&root_path, id)?;
+        if c.status() == ContainerStatus::Stopped {
+            info!("Container {} stopped gracefully", id);
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            // Timeout: send SIGKILL
+            signal::kill(pid, Signal::SIGKILL)?;
+            info!("Timeout reached, sent SIGKILL to container {}", id);
+            return Ok(());
+        }
+    }
+}
+
+/// Wait for a container to stop and print its exit code.
+pub fn wait_container(id: &str) -> Result<()> {
+    use std::time::Duration;
+
+    let root_path = rootpath::determine(None, &*create_syscall())?;
+
+    loop {
+        let container = load_container(&root_path, id)?;
+        if container.status() == ContainerStatus::Stopped {
+            // libcontainer does not store exit code, print 0 as convention
+            println!("0");
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}

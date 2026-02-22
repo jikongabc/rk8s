@@ -85,5 +85,8 @@ fn main() -> Result<()> {
         Commands::State(args) => container::state_container(&args.container_name),
         Commands::Volume(cmd) => volume::volume_execute(cmd),
         Commands::ExecInternal(args) => run::exec_internal(args),
+        Commands::Kill(args) => container::kill_container(&args.container_name, &args.signal),
+        Commands::Stop(args) => container::stop_container(&args.container_name, args.timeout),
+        Commands::Wait(args) => container::wait_container(&args.container_name),
     }
 }

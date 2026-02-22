@@ -54,6 +54,12 @@ pub enum Commands {
     Volume(VolumeCommand),
     #[command(hide = true)]
     ExecInternal(run::ExecInternalArgs),
+    /// Kill a running container
+    Kill(KillArgs),
+    /// Stop a running container (SIGTERM + wait)
+    Stop(StopArgs),
+    /// Wait until a container exits
+    Wait(WaitArgs),
 }
 
 /// Run a command in a new container
@@ -104,6 +110,35 @@ pub struct PsArgs {
     /// Specify the format (default or table)
     #[arg(long, short)]
     pub format: Option<String>,
+}
+
+/// Kill a container
+#[derive(Parser, Debug, Clone)]
+pub struct KillArgs {
+    #[arg(value_name = "CONTAINER_NAME")]
+    pub container_name: String,
+
+    /// Signal to send (default: SIGKILL)
+    #[arg(long, default_value = "KILL")]
+    pub signal: String,
+}
+
+/// Stop a container (SIGTERM + wait)
+#[derive(Parser, Debug, Clone)]
+pub struct StopArgs {
+    #[arg(value_name = "CONTAINER_NAME")]
+    pub container_name: String,
+
+    /// Timeout in seconds before SIGKILL
+    #[arg(long, default_value = "10")]
+    pub timeout: u64,
+}
+
+/// Wait for a container to exit
+#[derive(Parser, Debug, Clone)]
+pub struct WaitArgs {
+    #[arg(value_name = "CONTAINER_NAME")]
+    pub container_name: String,
 }
 
 /// Execute a command in a running container
