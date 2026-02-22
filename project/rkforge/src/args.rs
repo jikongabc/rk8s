@@ -60,6 +60,10 @@ pub enum Commands {
     Stop(StopArgs),
     /// Wait until a container exits
     Wait(WaitArgs),
+    /// Remove one or more containers
+    Rm(RmArgs),
+    /// Attach to a running container's stdio
+    Attach(AttachArgs),
 }
 
 /// Run a command in a new container
@@ -137,6 +141,27 @@ pub struct StopArgs {
 /// Wait for a container to exit
 #[derive(Parser, Debug, Clone)]
 pub struct WaitArgs {
+    #[arg(value_name = "CONTAINER_NAME")]
+    pub container_name: String,
+}
+/// Remove one or more containers
+#[derive(Parser, Debug, Clone)]
+pub struct RmArgs {
+    #[arg(value_name = "CONTAINER_NAME")]
+    pub container_name: Option<String>,
+
+    /// Force removal of a running container
+    #[arg(long, short = 'f')]
+    pub force: bool,
+
+    /// Remove all stopped containers
+    #[arg(long, short = 'a')]
+    pub all: bool,
+}
+
+/// Attach to a running container
+#[derive(Parser, Debug, Clone)]
+pub struct AttachArgs {
     #[arg(value_name = "CONTAINER_NAME")]
     pub container_name: String,
 }

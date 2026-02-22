@@ -874,7 +874,7 @@ mod test {
     }
 }
 
-/// Send a signal to a container's init process (pid 1).
+/// Send a signal to a container's init process (default: SIGKILL).
 pub fn kill_container(id: &str, signal: &str) -> Result<()> {
     use nix::sys::signal::{self, Signal};
     use std::str::FromStr;
@@ -902,13 +902,14 @@ pub fn kill_container(id: &str, signal: &str) -> Result<()> {
 
 /// Gracefully stop a container: SIGTERM first, then SIGKILL after timeout.
 pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
+    use nix::errno::Errno;
     use nix::sys::signal::{self, Signal};
+    use nix::sys::wait::{WaitStatus, waitpid};
     use std::time::{Duration, Instant};
 
     let root_path = rootpath::determine(None, &*create_syscall())?;
     let container = load_container(&root_path, id)?;
 
-    // If already stopped, do nothing
     if container.status() == ContainerStatus::Stopped {
         info!("Container {} is already stopped", id);
         return Ok(());
@@ -918,7 +919,6 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
         .pid()
         .ok_or_else(|| anyhow!("container {} has no pid", id))?;
 
-    // Send SIGTERM
     signal::kill(pid, Signal::SIGTERM)?;
     info!("Sent SIGTERM to container {}", id);
 
@@ -934,9 +934,17 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
         }
 
         if Instant::now() >= deadline {
-            // Timeout: send SIGKILL
             signal::kill(pid, Signal::SIGKILL)?;
             info!("Timeout reached, sent SIGKILL to container {}", id);
+            // Wait for process to be reaped to avoid zombie, retry on EINTR
+            loop {
+                match waitpid(pid, None) {
+                    std::result::Result::Ok(WaitStatus::Exited(..))
+                    | std::result::Result::Ok(WaitStatus::Signaled(..)) => break,
+                    std::result::Result::Err(Errno::EINTR) => continue,
+                    _ => break,
+                }
+            }
             return Ok(());
         }
     }
@@ -957,4 +965,223 @@ pub fn wait_container(id: &str) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Remove a container and its metadata.
+/// -f: force remove running container; -a: remove all stopped containers (with -f, also removes running).
+pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
+    use nix::errno::Errno;
+    use nix::sys::signal::{self, Signal};
+    use nix::sys::wait::{WaitStatus, waitpid};
+
+    // Send SIGKILL and wait for process exit, retrying on EINTR to avoid zombie.
+    let force_kill = |pid: nix::unistd::Pid| {
+        let _ = signal::kill(pid, Signal::SIGKILL);
+        loop {
+            match waitpid(pid, None) {
+                std::result::Result::Ok(WaitStatus::Exited(..))
+                | std::result::Result::Ok(WaitStatus::Signaled(..)) => break,
+                std::result::Result::Err(Errno::EINTR) => continue, // retry on interrupt
+                _ => break,
+            }
+        }
+    };
+
+    let root_path = rootpath::determine(None, &*create_syscall())?;
+
+    if all {
+        let entries = fs::read_dir(&root_path)?;
+        for entry in entries.flatten() {
+            let container_id = entry.file_name().to_string_lossy().to_string();
+            // Skip entries that are not valid container directories
+            let container = match load_container(&root_path, &container_id) {
+                std::result::Result::Ok(c) => c,
+                std::result::Result::Err(e) => {
+                    warn!("Skipping {}: not a valid container ({})", container_id, e);
+                    continue;
+                }
+            };
+            if container.status() == ContainerStatus::Stopped {
+                delete_container(&container_id)?;
+                info!("Removed container {}", container_id);
+            } else if force {
+                if let Some(pid) = container.pid() {
+                    force_kill(pid);
+                }
+                delete_container(&container_id)?;
+                info!("Force removed container {}", container_id);
+            } else {
+                info!(
+                    "Skipping running container {} (use -f to force remove)",
+                    container_id
+                );
+            }
+        }
+        return Ok(());
+    }
+
+    let id = id.ok_or_else(|| anyhow!("container name is required unless -a is specified"))?;
+    let container = load_container(&root_path, id)?;
+
+    if container.status() != ContainerStatus::Stopped {
+        if force {
+            if let Some(pid) = container.pid() {
+                force_kill(pid);
+            }
+        } else {
+            return Err(anyhow!(
+                "container {} is running, use -f to force remove",
+                id
+            ));
+        }
+    }
+
+    delete_container(id)?;
+    info!("Removed container {}", id);
+    Ok(())
+}
+
+/// RAII guard that restores terminal settings on drop, ensuring recovery even on panic.
+struct TermGuard {
+    orig: nix::sys::termios::Termios,
+}
+
+impl Drop for TermGuard {
+    fn drop(&mut self) {
+        use nix::sys::termios::{self, SetArg};
+        use std::os::fd::BorrowedFd;
+        let fd = unsafe { BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
+        let _ = termios::tcsetattr(fd, SetArg::TCSANOW, &self.orig);
+    }
+}
+
+/// Attach to a running container's stdio via /proc/<pid>/fd.
+/// Forwards stdout and stderr concurrently via background threads.
+/// Press Ctrl+P then Ctrl+Q to detach without stopping the container.
+pub fn attach_container(id: &str) -> Result<()> {
+    use anyhow::Context;
+    use nix::sys::termios::{self, SetArg};
+    use std::io::{Read, Write};
+    use std::os::fd::BorrowedFd;
+    use std::os::unix::io::AsRawFd;
+
+    let root_path = rootpath::determine(None, &*create_syscall())?;
+    let container = load_container(&root_path, id)?;
+
+    if container.status() != ContainerStatus::Running {
+        return Err(anyhow!("container {} is not running", id));
+    }
+
+    let pid = container
+        .pid()
+        .ok_or_else(|| anyhow!("container {} has no pid", id))?;
+
+    let pid_raw = pid.as_raw();
+
+    // Access container stdio via /proc/<pid>/fd
+    let stdout_path = format!("/proc/{}/fd/1", pid_raw);
+    let stderr_path = format!("/proc/{}/fd/2", pid_raw);
+    let stdin_path = format!("/proc/{}/fd/0", pid_raw);
+
+    let mut container_stdout = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&stdout_path)
+        .with_context(|| format!("Failed to open container stdout: {}", stdout_path))?;
+    let mut container_stderr = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&stderr_path)
+        .with_context(|| format!("Failed to open container stderr: {}", stderr_path))?;
+    let mut container_stdin = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&stdin_path)
+        .with_context(|| format!("Failed to open container stdin: {}", stdin_path))?;
+
+    // Save fd numbers before moving into threads, used to unblock reader threads on detach
+    let stdout_fd = container_stdout.as_raw_fd();
+    let stderr_fd = container_stderr.as_raw_fd();
+
+    // Switch host terminal to raw mode so we can intercept individual keystrokes
+    let stdin_fd = unsafe { BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
+    let original_termios = termios::tcgetattr(stdin_fd)?;
+    let mut raw = original_termios.clone();
+    termios::cfmakeraw(&mut raw);
+    termios::tcsetattr(stdin_fd, SetArg::TCSANOW, &raw)?;
+
+    // TermGuard ensures terminal is restored even if this function panics
+    let _guard = TermGuard {
+        orig: original_termios,
+    };
+
+    println!("Attached to {}. Use Ctrl+P, Ctrl+Q to detach.", id);
+
+    // Forward container stdout -> host stdout
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let mut host_stdout = std::io::stdout();
+        loop {
+            match container_stdout.read(&mut buf) {
+                std::result::Result::Ok(0) | std::result::Result::Err(_) => break,
+                std::result::Result::Ok(n) => {
+                    let _ = host_stdout.write_all(&buf[..n]);
+                    let _ = host_stdout.flush();
+                }
+            }
+        }
+    });
+
+    // Forward container stderr -> host stderr
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let mut host_stderr = std::io::stderr();
+        loop {
+            match container_stderr.read(&mut buf) {
+                std::result::Result::Ok(0) | std::result::Result::Err(_) => break,
+                std::result::Result::Ok(n) => {
+                    let _ = host_stderr.write_all(&buf[..n]);
+                    let _ = host_stderr.flush();
+                }
+            }
+        }
+    });
+
+    // Forward host stdin -> container stdin
+    // Ctrl+P (0x10) followed by Ctrl+Q (0x11) detaches; both bytes are swallowed
+    let mut buf = [0u8; 1];
+    let mut last_was_ctrl_p = false;
+    let mut host_stdin = std::io::stdin();
+
+    loop {
+        match host_stdin.read(&mut buf) {
+            std::result::Result::Ok(0) | std::result::Result::Err(_) => break,
+            std::result::Result::Ok(_) => {
+                let byte = buf[0];
+                if last_was_ctrl_p {
+                    if byte == 0x11 {
+                        // Close container stdin immediately
+                        drop(container_stdin);
+                        // Close stdout/stderr fds to unblock reader threads
+                        let _ = nix::unistd::close(stdout_fd);
+                        let _ = nix::unistd::close(stderr_fd);
+                        break;
+                    }
+                    last_was_ctrl_p = false;
+                    continue;
+                }
+                if byte == 0x10 {
+                    last_was_ctrl_p = true;
+                    continue;
+                }
+                let _ = container_stdin.write_all(&buf);
+            }
+        }
+    }
+
+    // Restore terminal before printing so output appears correctly
+    drop(_guard);
+    println!("\nDetached from container {}.", id);
+
+    // Threads exit naturally after fds are closed; no join needed
+    drop(stdout_thread);
+    drop(stderr_thread);
+    Ok(())
 }

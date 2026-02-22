@@ -88,5 +88,9 @@ fn main() -> Result<()> {
         Commands::Kill(args) => container::kill_container(&args.container_name, &args.signal),
         Commands::Stop(args) => container::stop_container(&args.container_name, args.timeout),
         Commands::Wait(args) => container::wait_container(&args.container_name),
+        Commands::Rm(args) => {
+            container::rm_container(args.container_name.as_deref(), args.force, args.all)
+        }
+        Commands::Attach(args) => container::attach_container(&args.container_name),
     }
 }
