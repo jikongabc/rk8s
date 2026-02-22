@@ -137,17 +137,19 @@ pub struct StopArgs {
     #[arg(long, default_value = "10")]
     pub timeout: u64,
 }
-
 /// Wait for a container to exit
 #[derive(Parser, Debug, Clone)]
 pub struct WaitArgs {
     #[arg(value_name = "CONTAINER_NAME")]
     pub container_name: String,
 
-    /// Timeout in seconds (0 means wait indefinitely)
+    /// Timeout in seconds (0 means wait indefinitely).
+    /// Note: exit code is always 0 if libcontainer does not expose the actual exit code.
     #[arg(long, default_value = "0")]
     pub timeout: u64,
 }
+
+/// Remove one or more containers
 /// Remove one or more containers
 #[derive(Parser, Debug, Clone)]
 pub struct RmArgs {

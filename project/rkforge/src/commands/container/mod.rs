@@ -956,12 +956,40 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
 }
 
 /// Wait for a container to stop and print its exit code.
-/// Note: exit code is always 0 because libcontainer does not expose it.
+/// Tries waitpid for a real exit code; falls back to polling if the container
+/// is not a direct child (libcontainer uses double-fork). In the fallback case,
+/// exit code is always 0 because libcontainer does not expose it.
 /// If timeout is 0, wait indefinitely; otherwise return error on timeout.
 pub fn wait_container(id: &str, timeout_secs: u64) -> Result<()> {
+    use nix::sys::wait::{WaitStatus, waitpid};
     use std::time::{Duration, Instant};
 
     let root_path = rootpath::determine(None, &*create_syscall())?;
+    let container = load_container(&root_path, id)?;
+
+    if container.status() == ContainerStatus::Stopped {
+        println!("0");
+        return Ok(());
+    }
+
+    let pid = container
+        .pid()
+        .ok_or_else(|| anyhow!("container {} has no pid", id))?;
+
+    // Try waitpid first; works if container process is a direct child of rkforge
+    match waitpid(pid, None) {
+        std::result::Result::Ok(WaitStatus::Exited(_, code)) => {
+            println!("{}", code);
+            return Ok(());
+        }
+        std::result::Result::Ok(WaitStatus::Signaled(_, sig, _)) => {
+            println!("{}", 128 + sig as i32);
+            return Ok(());
+        }
+        // ECHILD: not a direct child, fall back to polling below
+        _ => {}
+    }
+
     let deadline = if timeout_secs > 0 {
         Some(Instant::now() + Duration::from_secs(timeout_secs))
     } else {
@@ -969,8 +997,8 @@ pub fn wait_container(id: &str, timeout_secs: u64) -> Result<()> {
     };
 
     loop {
-        let container = load_container(&root_path, id)?;
-        if container.status() == ContainerStatus::Stopped {
+        let c = load_container(&root_path, id)?;
+        if c.status() == ContainerStatus::Stopped {
             // libcontainer does not store exit code; print 0 as convention
             println!("0");
             return Ok(());
@@ -1173,6 +1201,7 @@ pub fn attach_container(id: &str) -> Result<()> {
     // Only the exact two-byte sequence is consumed; other keys are forwarded normally.
     let mut buf = [0u8; 1];
     let mut last_was_ctrl_p = false;
+    let mut detached = false;
     let mut host_stdin = std::io::stdin();
 
     loop {
@@ -1187,6 +1216,7 @@ pub fn attach_container(id: &str) -> Result<()> {
                         drop(container_stdin);
                         let _ = nix::unistd::close(stdout_wake_fd);
                         let _ = nix::unistd::close(stderr_wake_fd);
+                        detached = true;
                         break;
                     }
                     // Not a detach sequence: forward the pending Ctrl+P and current byte
@@ -1206,10 +1236,18 @@ pub fn attach_container(id: &str) -> Result<()> {
 
     // Restore terminal before printing so output appears correctly
     drop(_guard);
-    println!("\nDetached from container {}.", id);
 
-    // Join threads to ensure ordered shutdown
-    let _ = stdout_thread.join();
-    let _ = stderr_thread.join();
+    if detached {
+        println!("\nDetached from container {}.", id);
+        // Threads are blocked on container fds; drop handles without joining so
+        // attach returns immediately. Threads will be cleaned up when process exits.
+        drop(stdout_thread);
+        drop(stderr_thread);
+    } else {
+        // Container closed its stdio (EOF); join threads for ordered shutdown
+        let _ = stdout_thread.join();
+        let _ = stderr_thread.join();
+    }
+
     Ok(())
 }
