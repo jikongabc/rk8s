@@ -1107,8 +1107,7 @@ pub fn attach_container(id: &str) -> Result<()> {
     use anyhow::Context;
     use nix::sys::termios::{self, SetArg};
     use std::io::{Read, Write};
-    use std::os::fd::{BorrowedFd, OwnedFd};
-    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::os::fd::BorrowedFd;
 
     let root_path = rootpath::determine(None, &*create_syscall())?;
     let container = load_container(&root_path, id)?;
@@ -1139,22 +1138,6 @@ pub fn attach_container(id: &str) -> Result<()> {
         .write(true)
         .open(&stdin_path)
         .with_context(|| format!("Failed to open container stdin: {}", stdin_path))?;
-
-    // dup() into OwnedFd for RAII cleanup on both detach and EOF paths.
-    // These are independent fd table entries and do not affect the reader threads,
-    // which own container_stdout/stderr and exit only when the container closes its fds.
-    let stdout_wake_fd: OwnedFd = unsafe {
-        OwnedFd::from_raw_fd(
-            nix::unistd::dup(container_stdout.as_raw_fd())
-                .with_context(|| "Failed to dup stdout fd")?,
-        )
-    };
-    let stderr_wake_fd: OwnedFd = unsafe {
-        OwnedFd::from_raw_fd(
-            nix::unistd::dup(container_stderr.as_raw_fd())
-                .with_context(|| "Failed to dup stderr fd")?,
-        )
-    };
 
     // Switch host terminal to raw mode so we can intercept individual keystrokes
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
@@ -1241,17 +1224,12 @@ pub fn attach_container(id: &str) -> Result<()> {
         println!("\nDetached from container {}.", id);
         // Threads block on container fds until the container exits; drop handles
         // without joining so attach returns immediately.
-        drop(stdout_wake_fd);
-        drop(stderr_wake_fd);
         drop(stdout_thread);
         drop(stderr_thread);
     } else {
         // Container closed its stdio (EOF); join threads for ordered shutdown
-        drop(stdout_wake_fd);
-        drop(stderr_wake_fd);
         let _ = stdout_thread.join();
         let _ = stderr_thread.join();
     }
-
     Ok(())
 }
