@@ -619,15 +619,12 @@ pub fn delete_container(id: &str) -> Result<()> {
         container_id: id.to_string(),
         force: true,
     };
-    // delete the network
     let container = load_container(&root_path, id)?;
-    let pid = container
-        .pid()
-        .ok_or(anyhow!("invalid container {} can't find pid", id))?;
-    remove_container_network(pid)?;
-
+    // PID may be absent for stopped containers; network removal is best-effort
+    if let Some(pid) = container.pid() {
+        remove_container_network(pid)?;
+    }
     delete(delete_args, root_path)?;
-
     Ok(())
 }
 
@@ -1047,13 +1044,21 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
                 }
             };
             if container.status() == ContainerStatus::Stopped {
+                let bundle_path = container.bundle().to_path_buf();
                 delete_container(&container_id)?;
+                if bundle_path.exists() {
+                    fs::remove_dir_all(&bundle_path)?;
+                }
                 println!("Removed container {}", container_id);
             } else if force {
+                let bundle_path = container.bundle().to_path_buf();
                 if let Some(pid) = container.pid() {
                     force_kill(pid);
                 }
                 delete_container(&container_id)?;
+                if bundle_path.exists() {
+                    fs::remove_dir_all(&bundle_path)?;
+                }
                 println!("Force removed container {}", container_id);
             } else {
                 println!(
@@ -1067,6 +1072,7 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
 
     let id = id.ok_or_else(|| anyhow!("container name is required unless -a is specified"))?;
     let container = load_container(&root_path, id)?;
+    let bundle_path = container.bundle().to_path_buf();
 
     if container.status() != ContainerStatus::Stopped {
         if force {
@@ -1082,6 +1088,9 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
     }
 
     delete_container(id)?;
+    if bundle_path.exists() {
+        fs::remove_dir_all(&bundle_path)?;
+    }
     println!("Removed container {}", id);
     Ok(())
 }
