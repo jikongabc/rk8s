@@ -1003,10 +1003,10 @@ pub fn wait_container(id: &str, timeout_secs: u64) -> Result<()> {
             println!("0");
             return Ok(());
         }
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
-                return Err(anyhow!("timeout waiting for container {} to stop", id));
-            }
+        if let Some(dl) = deadline
+            && Instant::now() >= dl
+        {
+            return Err(anyhow!("timeout waiting for container {} to stop", id));
         }
         std::thread::sleep(Duration::from_millis(200));
     }
