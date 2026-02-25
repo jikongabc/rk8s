@@ -898,7 +898,12 @@ pub fn kill_container(id: &str, signal: &str) -> Result<()> {
         }
     };
 
-    let sig = Signal::from_str(&sig_str).map_err(|_| anyhow!("unknown signal: {}", signal))?;
+    let sig = Signal::from_str(&sig_str).map_err(|_| {
+        anyhow!(
+            "unknown signal '{}'; valid signals are standard POSIX names like KILL, TERM, HUP, INT (with or without 'SIG' prefix, case-insensitive)",
+            signal
+        )
+    })?;
 
     signal::kill(pid, sig)?;
     println!("Sent {} to container {}", sig_str, id);
@@ -946,6 +951,13 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
+            }
+            if proc_path.exists() {
+                warn!(
+                    "Process {} for container {} still exists after SIGKILL",
+                    pid.as_raw(),
+                    id
+                );
             }
             return Ok(());
         }
@@ -1000,10 +1012,10 @@ pub fn wait_container(id: &str, timeout_secs: u64) -> Result<()> {
             println!("0");
             return Ok(());
         }
-        if let Some(dl) = deadline
-            && Instant::now() >= dl
-        {
-            return Err(anyhow!("timeout waiting for container {} to stop", id));
+        if let Some(dl) = deadline {
+            if Instant::now() >= dl {
+                return Err(anyhow!("timeout waiting for container {} to stop", id));
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -1026,6 +1038,9 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+        if proc_path.exists() {
+            warn!("Process {} still exists after SIGKILL", pid.as_raw());
         }
     };
 
@@ -1104,6 +1119,7 @@ impl Drop for TermGuard {
     fn drop(&mut self) {
         use nix::sys::termios::{self, SetArg};
         use std::os::fd::BorrowedFd;
+        // SAFETY: STDIN_FILENO (0) is a valid file descriptor that always exists for the process.
         let fd = unsafe { BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
         let _ = termios::tcsetattr(fd, SetArg::TCSANOW, &self.orig);
     }
@@ -1112,6 +1128,7 @@ impl Drop for TermGuard {
 /// Attach to a running container's stdio via /proc/<pid>/fd.
 /// Forwards stdout and stderr concurrently via background threads.
 /// Press Ctrl+P then Ctrl+Q to detach without stopping the container.
+/// Note: requires container stdio to be accessible via /proc/<pid>/fd.
 pub fn attach_container(id: &str) -> Result<()> {
     use anyhow::Context;
     use nix::sys::termios::{self, SetArg};
@@ -1148,7 +1165,7 @@ pub fn attach_container(id: &str) -> Result<()> {
         .open(&stdin_path)
         .with_context(|| format!("Failed to open container stdin: {}", stdin_path))?;
 
-    // Switch host terminal to raw mode so we can intercept individual keystrokes
+    // SAFETY: STDIN_FILENO (0) is a valid file descriptor that always exists for the process.
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
     let original_termios = termios::tcgetattr(stdin_fd)?;
     let mut raw = original_termios.clone();
@@ -1169,7 +1186,11 @@ pub fn attach_container(id: &str) -> Result<()> {
         let mut container_stdout = container_stdout;
         loop {
             match container_stdout.read(&mut buf) {
-                std::result::Result::Ok(0) | std::result::Result::Err(_) => break,
+                std::result::Result::Ok(0) => break,
+                std::result::Result::Err(e) => {
+                    tracing::debug!("Error reading container stdout: {}", e);
+                    break;
+                }
                 std::result::Result::Ok(n) => {
                     let _ = host_stdout.write_all(&buf[..n]);
                     let _ = host_stdout.flush();
@@ -1184,7 +1205,11 @@ pub fn attach_container(id: &str) -> Result<()> {
         let mut container_stderr = container_stderr;
         loop {
             match container_stderr.read(&mut buf) {
-                std::result::Result::Ok(0) | std::result::Result::Err(_) => break,
+                std::result::Result::Ok(0) => break,
+                std::result::Result::Err(e) => {
+                    tracing::debug!("Error reading container stderr: {}", e);
+                    break;
+                }
                 std::result::Result::Ok(n) => {
                     let _ = host_stderr.write_all(&buf[..n]);
                     let _ = host_stderr.flush();
@@ -1213,15 +1238,22 @@ pub fn attach_container(id: &str) -> Result<()> {
                         break;
                     }
                     // Not a detach sequence: forward the held Ctrl+P and current byte
-                    let _ = container_stdin.write_all(&[0x10]);
-                    let _ = container_stdin.write_all(&buf);
+                    if container_stdin
+                        .write_all(&[0x10])
+                        .and_then(|_| container_stdin.write_all(&buf))
+                        .is_err()
+                    {
+                        break;
+                    }
                     continue;
                 }
                 if byte == 0x10 {
                     last_was_ctrl_p = true;
                     continue;
                 }
-                let _ = container_stdin.write_all(&buf);
+                if container_stdin.write_all(&buf).is_err() {
+                    break;
+                }
             }
         }
     }
