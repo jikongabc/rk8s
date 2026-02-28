@@ -876,7 +876,22 @@ mod test {
 const MANAGED_BUNDLE_ROOT: &str = "/var/lib/rkl/bundle";
 
 fn is_managed_bundle(path: &std::path::Path) -> bool {
-    path.starts_with(MANAGED_BUNDLE_ROOT)
+    // Canonicalize to resolve ".." and symlinks before the prefix check,
+    // preventing a crafted bundle path from escaping the managed root.
+    match std::fs::canonicalize(path) {
+        std::result::Result::Ok(canonical) => canonical.starts_with(MANAGED_BUNDLE_ROOT),
+        // Path doesn't exist yet; fall back to lexical check
+        std::result::Result::Err(_) => path.starts_with(MANAGED_BUNDLE_ROOT),
+    }
+}
+
+fn normalize_signal(signal: &str) -> String {
+    let upper = signal.to_uppercase();
+    if upper.starts_with("SIG") {
+        upper
+    } else {
+        format!("SIG{}", upper)
+    }
 }
 
 /// Send a signal to a container's init process (default: SIGKILL).
@@ -895,16 +910,7 @@ pub fn kill_container(id: &str, signal: &str) -> Result<()> {
         .pid()
         .ok_or_else(|| anyhow!("container {} has no pid", id))?;
 
-    // Accept "kill", "KILL", "sigkill", "SIGKILL" formats
-    let sig_str = {
-        let upper = signal.to_uppercase();
-        if upper.starts_with("SIG") {
-            upper
-        } else {
-            format!("SIG{}", upper)
-        }
-    };
-
+    let sig_str = normalize_signal(signal);
     let sig = Signal::from_str(&sig_str).map_err(|_| {
         anyhow!(
             "unknown signal '{}'; valid signals are standard POSIX names like KILL, TERM, HUP, INT (with or without 'SIG' prefix, case-insensitive)",
@@ -918,6 +924,8 @@ pub fn kill_container(id: &str, signal: &str) -> Result<()> {
 }
 
 /// Gracefully stop a container: SIGTERM first, then SIGKILL after timeout.
+/// timeout_secs = 0 sends SIGKILL immediately after the first 200 ms poll;
+/// use wait_container for indefinite waiting semantics.
 pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
     use nix::sys::signal::{self, Signal};
     use std::time::{Duration, Instant};
@@ -928,6 +936,14 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
     if container.status() == ContainerStatus::Stopped {
         println!("Container {} is already stopped", id);
         return Ok(());
+    }
+
+    if container.status() != ContainerStatus::Running {
+        return Err(anyhow!(
+            "container {} is not running (status: {})",
+            id,
+            container.status()
+        ));
     }
 
     let pid = container
@@ -1294,24 +1310,13 @@ mod lifecycle_tests {
     use super::*;
 
     #[test]
-    fn test_kill_signal_normalization() {
-        let cases = [
-            ("kill", "SIGKILL"),
-            ("KILL", "SIGKILL"),
-            ("sigkill", "SIGKILL"),
-            ("SIGKILL", "SIGKILL"),
-            ("term", "SIGTERM"),
-            ("SIGTERM", "SIGTERM"),
-        ];
-        for (input, expected) in cases {
-            let upper = input.to_uppercase();
-            let result = if upper.starts_with("SIG") {
-                upper.clone()
-            } else {
-                format!("SIG{}", upper)
-            };
-            assert_eq!(result, expected, "failed for input: {}", input);
-        }
+    fn test_normalize_signal() {
+        assert_eq!(normalize_signal("kill"), "SIGKILL");
+        assert_eq!(normalize_signal("KILL"), "SIGKILL");
+        assert_eq!(normalize_signal("sigkill"), "SIGKILL");
+        assert_eq!(normalize_signal("SIGKILL"), "SIGKILL");
+        assert_eq!(normalize_signal("term"), "SIGTERM");
+        assert_eq!(normalize_signal("SIGTERM"), "SIGTERM");
     }
 
     #[test]
