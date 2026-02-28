@@ -880,8 +880,8 @@ fn is_managed_bundle(path: &std::path::Path) -> bool {
     // preventing a crafted bundle path from escaping the managed root.
     match std::fs::canonicalize(path) {
         std::result::Result::Ok(canonical) => canonical.starts_with(MANAGED_BUNDLE_ROOT),
-        // Path doesn't exist yet; fall back to lexical check
-        std::result::Result::Err(_) => path.starts_with(MANAGED_BUNDLE_ROOT),
+        // If canonicalization fails, treat as unmanaged for safety.
+        std::result::Result::Err(_) => false,
     }
 }
 
@@ -966,6 +966,7 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
         if Instant::now() >= deadline {
             signal::kill(pid, Signal::SIGKILL)?;
             println!("Timeout reached, sent SIGKILL to container {}", id);
+
             // Poll /proc/<pid> until the process disappears, since waitpid only works
             // for direct children and container runtimes typically use double-fork.
             let proc_path = std::path::PathBuf::from(format!("/proc/{}", pid.as_raw()));
@@ -975,13 +976,17 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
+
             if proc_path.exists() {
                 warn!(
                     "Process {} for container {} still exists after SIGKILL",
                     pid.as_raw(),
                     id
                 );
+            } else {
+                println!("Container {} force-stopped", id);
             }
+
             return Ok(());
         }
     }
