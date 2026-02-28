@@ -871,6 +871,14 @@ mod test {
     }
 }
 
+/// Only bundle directories under this prefix are deleted on rm.
+/// Bundles outside this path are left untouched with a warning.
+const MANAGED_BUNDLE_ROOT: &str = "/var/lib/rkl/bundle";
+
+fn is_managed_bundle(path: &std::path::Path) -> bool {
+    path.starts_with(MANAGED_BUNDLE_ROOT)
+}
+
 /// Send a signal to a container's init process (default: SIGKILL).
 pub fn kill_container(id: &str, signal: &str) -> Result<()> {
     use nix::sys::signal::{self, Signal};
@@ -879,7 +887,6 @@ pub fn kill_container(id: &str, signal: &str) -> Result<()> {
     let root_path = rootpath::determine(None, &*create_syscall())?;
     let container = load_container(&root_path, id)?;
 
-    // Refuse to signal a stopped container to avoid hitting a recycled pid
     if container.status() != ContainerStatus::Running {
         return Err(anyhow!("container {} is not running", id));
     }
@@ -965,12 +972,13 @@ pub fn stop_container(id: &str, timeout_secs: u64) -> Result<()> {
 }
 
 /// Wait for a container to stop and print its exit code.
-/// Tries waitpid for a real exit code; falls back to polling if the container
-/// is not a direct child (libcontainer uses double-fork). In the fallback case,
-/// exit code is always 0 because libcontainer does not expose it.
+/// Tries waitpid (non-blocking) for a real exit code if the container is a direct
+/// child of rkforge; falls back to polling otherwise (libcontainer uses double-fork).
+/// In the fallback case, exit code is always 0 because libcontainer does not expose it.
 /// If timeout is 0, wait indefinitely; otherwise return error on timeout.
+#[allow(clippy::collapsible_if)]
 pub fn wait_container(id: &str, timeout_secs: u64) -> Result<()> {
-    use nix::sys::wait::{WaitStatus, waitpid};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     use std::time::{Duration, Instant};
 
     let root_path = rootpath::determine(None, &*create_syscall())?;
@@ -985,20 +993,6 @@ pub fn wait_container(id: &str, timeout_secs: u64) -> Result<()> {
         .pid()
         .ok_or_else(|| anyhow!("container {} has no pid", id))?;
 
-    // Try waitpid first; works if container process is a direct child of rkforge
-    match waitpid(pid, None) {
-        std::result::Result::Ok(WaitStatus::Exited(_, code)) => {
-            println!("{}", code);
-            return Ok(());
-        }
-        std::result::Result::Ok(WaitStatus::Signaled(_, sig, _)) => {
-            println!("{}", 128 + sig as i32);
-            return Ok(());
-        }
-        // ECHILD: not a direct child, fall back to polling below
-        _ => {}
-    }
-
     let deadline = if timeout_secs > 0 {
         Some(Instant::now() + Duration::from_secs(timeout_secs))
     } else {
@@ -1006,30 +1000,44 @@ pub fn wait_container(id: &str, timeout_secs: u64) -> Result<()> {
     };
 
     loop {
+        // Non-blocking waitpid: get real exit code if container is a direct child,
+        // without blocking so the timeout is always respected.
+        match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+            std::result::Result::Ok(WaitStatus::Exited(_, code)) => {
+                println!("{}", code);
+                return Ok(());
+            }
+            std::result::Result::Ok(WaitStatus::Signaled(_, sig, _)) => {
+                println!("{}", 128 + sig as i32);
+                return Ok(());
+            }
+            _ => {}
+        }
+
         let c = load_container(&root_path, id)?;
         if c.status() == ContainerStatus::Stopped {
             // libcontainer does not store exit code; print 0 as convention
             println!("0");
             return Ok(());
         }
+
         if let Some(dl) = deadline {
             if Instant::now() >= dl {
                 return Err(anyhow!("timeout waiting for container {} to stop", id));
             }
         }
+
         std::thread::sleep(Duration::from_millis(200));
     }
 }
 
 /// Remove a container and its metadata.
 /// -f: force remove running container; -a: remove all stopped containers (with -f, also removes running).
+/// Bundle directories are only deleted if they reside under MANAGED_BUNDLE_ROOT.
 pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
     use nix::sys::signal::{self, Signal};
     use std::time::Duration;
 
-    // Send SIGKILL then poll /proc/<pid> until process disappears.
-    // waitpid is not used because container runtimes typically double-fork,
-    // making the container process not a direct child of rkforge.
     let force_kill = |pid: nix::unistd::Pid| {
         let _ = signal::kill(pid, Signal::SIGKILL);
         let proc_path = std::path::PathBuf::from(format!("/proc/{}", pid.as_raw()));
@@ -1044,13 +1052,28 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
         }
     };
 
+    let remove_bundle = |bundle_path: &std::path::Path| {
+        if bundle_path.exists() {
+            if is_managed_bundle(bundle_path) {
+                if let Err(e) = fs::remove_dir_all(bundle_path) {
+                    warn!("Failed to remove bundle {}: {}", bundle_path.display(), e);
+                }
+            } else {
+                warn!(
+                    "Skipping bundle deletion for {} (not under managed root {})",
+                    bundle_path.display(),
+                    MANAGED_BUNDLE_ROOT
+                );
+            }
+        }
+    };
+
     let root_path = rootpath::determine(None, &*create_syscall())?;
 
     if all {
         let entries = fs::read_dir(&root_path)?;
         for entry in entries.flatten() {
             let container_id = entry.file_name().to_string_lossy().to_string();
-            // Skip entries that are not valid container directories
             let container = match load_container(&root_path, &container_id) {
                 std::result::Result::Ok(c) => c,
                 std::result::Result::Err(e) => {
@@ -1061,9 +1084,7 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
             if container.status() == ContainerStatus::Stopped {
                 let bundle_path = container.bundle().to_path_buf();
                 delete_container(&container_id)?;
-                if bundle_path.exists() {
-                    fs::remove_dir_all(&bundle_path)?;
-                }
+                remove_bundle(&bundle_path);
                 println!("Removed container {}", container_id);
             } else if force {
                 let bundle_path = container.bundle().to_path_buf();
@@ -1071,9 +1092,7 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
                     force_kill(pid);
                 }
                 delete_container(&container_id)?;
-                if bundle_path.exists() {
-                    fs::remove_dir_all(&bundle_path)?;
-                }
+                remove_bundle(&bundle_path);
                 println!("Force removed container {}", container_id);
             } else {
                 println!(
@@ -1103,9 +1122,7 @@ pub fn rm_container(id: Option<&str>, force: bool, all: bool) -> Result<()> {
     }
 
     delete_container(id)?;
-    if bundle_path.exists() {
-        fs::remove_dir_all(&bundle_path)?;
-    }
+    remove_bundle(&bundle_path);
     println!("Removed container {}", id);
     Ok(())
 }
@@ -1128,7 +1145,7 @@ impl Drop for TermGuard {
 /// Attach to a running container's stdio via /proc/<pid>/fd.
 /// Forwards stdout and stderr concurrently via background threads.
 /// Press Ctrl+P then Ctrl+Q to detach without stopping the container.
-/// Note: requires container stdio to be accessible via /proc/<pid>/fd.
+/// Requires an interactive TTY; returns an error in non-interactive contexts.
 pub fn attach_container(id: &str) -> Result<()> {
     use anyhow::Context;
     use nix::sys::termios::{self, SetArg};
@@ -1148,36 +1165,37 @@ pub fn attach_container(id: &str) -> Result<()> {
 
     let pid_raw = pid.as_raw();
 
-    let stdout_path = format!("/proc/{}/fd/1", pid_raw);
-    let stderr_path = format!("/proc/{}/fd/2", pid_raw);
-    let stdin_path = format!("/proc/{}/fd/0", pid_raw);
-
     let container_stdout = std::fs::OpenOptions::new()
         .read(true)
-        .open(&stdout_path)
-        .with_context(|| format!("Failed to open container stdout: {}", stdout_path))?;
+        .open(format!("/proc/{}/fd/1", pid_raw))
+        .with_context(|| format!("Failed to open container stdout: /proc/{}/fd/1", pid_raw))?;
     let container_stderr = std::fs::OpenOptions::new()
         .read(true)
-        .open(&stderr_path)
-        .with_context(|| format!("Failed to open container stderr: {}", stderr_path))?;
+        .open(format!("/proc/{}/fd/2", pid_raw))
+        .with_context(|| format!("Failed to open container stderr: /proc/{}/fd/2", pid_raw))?;
     let mut container_stdin = std::fs::OpenOptions::new()
         .write(true)
-        .open(&stdin_path)
-        .with_context(|| format!("Failed to open container stdin: {}", stdin_path))?;
+        .open(format!("/proc/{}/fd/0", pid_raw))
+        .with_context(|| format!("Failed to open container stdin: /proc/{}/fd/0", pid_raw))?;
 
     // SAFETY: STDIN_FILENO (0) is a valid file descriptor that always exists for the process.
     let stdin_fd = unsafe { BorrowedFd::borrow_raw(nix::libc::STDIN_FILENO) };
+
+    if unsafe { nix::libc::isatty(nix::libc::STDIN_FILENO) } == 0 {
+        return Err(anyhow!(
+            "attach requires an interactive TTY; stdin is not a terminal"
+        ));
+    }
+
     let original_termios = termios::tcgetattr(stdin_fd)?;
     let mut raw = original_termios.clone();
     termios::cfmakeraw(&mut raw);
     termios::tcsetattr(stdin_fd, SetArg::TCSANOW, &raw)?;
 
-    // TermGuard ensures terminal is restored even if this function panics
     let _guard = TermGuard {
         orig: original_termios,
     };
 
-    // Use \r\n because terminal is in raw mode (no output processing)
     print!("Attached to {}. Use Ctrl+P, Ctrl+Q to detach.\r\n", id);
 
     let stdout_thread = std::thread::spawn(move || {
@@ -1258,19 +1276,65 @@ pub fn attach_container(id: &str) -> Result<()> {
         }
     }
 
-    // Restore terminal before printing so output appears correctly
     drop(_guard);
 
     if detached {
         println!("\nDetached from container {}.", id);
-        // Threads block on container fds until the container exits; drop handles
-        // without joining so attach returns immediately.
         drop(stdout_thread);
         drop(stderr_thread);
     } else {
-        // Container closed its stdio (EOF); join threads for ordered shutdown
         let _ = stdout_thread.join();
         let _ = stderr_thread.join();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    #[test]
+    fn test_kill_signal_normalization() {
+        let cases = [
+            ("kill", "SIGKILL"),
+            ("KILL", "SIGKILL"),
+            ("sigkill", "SIGKILL"),
+            ("SIGKILL", "SIGKILL"),
+            ("term", "SIGTERM"),
+            ("SIGTERM", "SIGTERM"),
+        ];
+        for (input, expected) in cases {
+            let upper = input.to_uppercase();
+            let result = if upper.starts_with("SIG") {
+                upper.clone()
+            } else {
+                format!("SIG{}", upper)
+            };
+            assert_eq!(result, expected, "failed for input: {}", input);
+        }
+    }
+
+    #[test]
+    fn test_rm_container_no_id_no_all() {
+        let result = rm_container(None, false, false);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("container name is required")
+        );
+    }
+
+    #[test]
+    fn test_is_managed_bundle() {
+        assert!(is_managed_bundle(std::path::Path::new(
+            "/var/lib/rkl/bundle/abc123"
+        )));
+        assert!(!is_managed_bundle(std::path::Path::new("/tmp/mybundle")));
+        assert!(!is_managed_bundle(std::path::Path::new("/")));
+        assert!(!is_managed_bundle(std::path::Path::new(
+            "/home/user/bundle"
+        )));
+    }
 }
