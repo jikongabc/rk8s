@@ -876,10 +876,13 @@ mod test {
 const MANAGED_BUNDLE_ROOT: &str = "/var/lib/rkl/bundle";
 
 fn is_managed_bundle(path: &std::path::Path) -> bool {
-    // Canonicalize to resolve ".." and symlinks before the prefix check,
-    // preventing a crafted bundle path from escaping the managed root.
+    is_managed_bundle_with_root(path, std::path::Path::new(MANAGED_BUNDLE_ROOT))
+}
+
+/// Testable helper that accepts a custom managed root.
+fn is_managed_bundle_with_root(path: &std::path::Path, managed_root: &std::path::Path) -> bool {
     match std::fs::canonicalize(path) {
-        std::result::Result::Ok(canonical) => canonical.starts_with(MANAGED_BUNDLE_ROOT),
+        std::result::Result::Ok(canonical) => canonical.starts_with(managed_root),
         // If canonicalization fails, treat as unmanaged for safety.
         std::result::Result::Err(_) => false,
     }
@@ -1338,13 +1341,28 @@ mod lifecycle_tests {
 
     #[test]
     fn test_is_managed_bundle() {
-        assert!(is_managed_bundle(std::path::Path::new(
-            "/var/lib/rkl/bundle/abc123"
-        )));
-        assert!(!is_managed_bundle(std::path::Path::new("/tmp/mybundle")));
-        assert!(!is_managed_bundle(std::path::Path::new("/")));
-        assert!(!is_managed_bundle(std::path::Path::new(
-            "/home/user/bundle"
-        )));
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a fake managed root
+        let managed_root = tmp.path().join("bundle");
+        fs::create_dir(&managed_root).unwrap();
+
+        // Create a container directory under managed root
+        let container_dir = managed_root.join("abc123");
+        fs::create_dir(&container_dir).unwrap();
+
+        assert!(is_managed_bundle_with_root(&container_dir, &managed_root));
+
+        // Outside path
+        let outside = tmp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+
+        assert!(!is_managed_bundle_with_root(&outside, &managed_root));
+
+        // Non-existent path
+        let nonexistent = managed_root.join("does_not_exist");
+        assert!(!is_managed_bundle_with_root(&nonexistent, &managed_root));
     }
 }
